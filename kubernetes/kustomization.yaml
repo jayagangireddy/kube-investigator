@@ -1,0 +1,10 @@
+﻿apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - role.yaml
+  - rolebinding.yaml
+  - server
+images:
+  - name: kube-investigator-mcp
+    newName: kubeinvestigatoracr5837.azurecr.io/kube-investigator-mcp
+    newTag: "0.2.0"
