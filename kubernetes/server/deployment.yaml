@@ -33,7 +33,11 @@ spec:
             - name: PORT
               value: "8000"
             - name: ASTRONOMY_NAMESPACES
-              value: "paymentservice"
+              value: "*"
+            - name: GITHUB_REPO_OWNER
+              value: "jayagangireddy"
+            - name: GITHUB_REPO_NAME
+              value: "kube-investigator"
             - name: KUBERNETES_API_TIMEOUT_SECONDS
               value: "4"
             - name: PYTHONDONTWRITEBYTECODE

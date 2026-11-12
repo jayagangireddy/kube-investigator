@@ -7,4 +7,4 @@ resources:
 images:
   - name: kube-investigator-mcp
     newName: kubeinvestigatoracr5837.azurecr.io/kube-investigator-mcp
-    newTag: "0.2.0"
+    newTag: "0.2.1"
