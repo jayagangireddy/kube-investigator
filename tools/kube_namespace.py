@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import ssl
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 API_TIMEOUT_SECONDS = float(os.getenv("KUBERNETES_API_TIMEOUT_SECONDS", "4"))
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 NAMESPACE_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -236,6 +242,26 @@ def _compact(kind: str, item: dict[str, Any]) -> dict[str, Any]:
             policyTypes=spec.get("policyTypes", []),
         )
 
+    evidence = []
+    def add(field: str, value: Any) -> None:
+        evidence.append({"tool": "inspect_namespace", "kind": kind,
+                         "namespace": metadata.get("namespace"), "resource": metadata.get("name"),
+                         "field": field, "value": value,
+                         "observedAt": datetime.now(timezone.utc).isoformat()})
+
+    if kind == "Pod":
+        for index, container in enumerate(status.get("containerStatuses", [])):
+            for state in ("waiting", "terminated"):
+                reason = container.get("state", {}).get(state, {}).get("reason")
+                if reason:
+                    add(f"status.containerStatuses[{index}].state.{state}.reason", reason)
+            if container.get("restartCount", 0):
+                add(f"status.containerStatuses[{index}].restartCount", container["restartCount"])
+        if not evidence and status.get("phase") not in (None, "Running", "Succeeded"):
+            add("status.phase", status["phase"])
+    elif kind == "Event" and item.get("type") == "Warning" and item.get("message"):
+        add("message", item["message"])
+    result["evidence"] = evidence
     return result
 
 
@@ -284,17 +310,66 @@ def _inspect_namespace(namespace: str) -> dict[str, Any]:
             if error:
                 errors[key] = error
 
+    evidence = [entry for items in resources.values() for item in items for entry in item.pop("evidence")]
+    for index, entry in enumerate(evidence, 1):
+        entry["id"] = f"ev-{index:03d}"
     return {
         "namespace": namespace,
         "resources": resources,
         "errors": errors,
+        "evidence": evidence,
     }
 
 
 
 def inspect_namespace(namespace: str) -> dict[str, Any]:
     """Return a compact snapshot of supported resources in an allowlisted namespace."""
-    return _inspect_namespace(namespace)
+    call_id = uuid.uuid4().hex[:12]
+    started_at = time.monotonic()
+    LOGGER.info("tool_call_started tool=inspect_namespace call_id=%s", call_id)
+    try:
+        result = _inspect_namespace(namespace)
+    except Exception as exc:
+        elapsed_ms = round((time.monotonic() - started_at) * 1000)
+        LOGGER.error(
+            "tool_call_failed tool=inspect_namespace call_id=%s error_type=%s elapsed_ms=%d",
+            call_id,
+            type(exc).__name__,
+            elapsed_ms,
+        )
+        raise
+
+    result.setdefault("evidence", [])
+    elapsed_ms = round((time.monotonic() - started_at) * 1000)
+    top_level_error = result.get("error")
+    if top_level_error:
+        LOGGER.warning(
+            "tool_call_rejected tool=inspect_namespace call_id=%s error_code=%s elapsed_ms=%d",
+            call_id,
+            top_level_error.get("code", "unknown"),
+            elapsed_ms,
+        )
+    elif result.get("errors"):
+        error_codes = sorted(
+            {
+                error.get("code", "unknown")
+                for error in result["errors"].values()
+            }
+        )
+        LOGGER.warning(
+            "tool_call_completed_with_resource_errors tool=inspect_namespace call_id=%s "
+            "error_codes=%s elapsed_ms=%d",
+            call_id,
+            ",".join(error_codes),
+            elapsed_ms,
+        )
+    else:
+        LOGGER.info(
+            "tool_call_completed tool=inspect_namespace call_id=%s elapsed_ms=%d",
+            call_id,
+            elapsed_ms,
+        )
+    return result
 
 
 

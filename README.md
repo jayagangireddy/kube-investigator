@@ -35,3 +35,20 @@ docker push YOUR_REGISTRY/kube-investigator-mcp:0.2.1
 kubectl apply -k kubernetes
 
 The server is internal only. For local access after deployment, port-forward the Service on port 8000 and use http://localhost:8000/mcp.
+
+## Local Foundry agent test
+
+The standalone `examples/test_foundry_mcp_agent.py` script first lists tools from the MCP server using unauthenticated Streamable HTTP, then creates a versioned Foundry Prompt Agent named `kube-investigator-mcp-test` and invokes it. The Foundry agent connects directly to the MCP server, bypassing Foundry Toolbox, and only `inspect_namespace` is enabled. Foundry API requests use `DefaultAzureCredential`; no credential, authorization header, or API key is configured for the MCP server. The MCP URL must be reachable from both the computer running the script and Foundry Agent Service. HTTPS is recommended because HTTP traffic is unencrypted.
+
+In a VS Code PowerShell terminal at the repository root, create a separate local environment and install the optional test dependencies:
+
+```powershell
+python -m venv .venv-agent-test
+.\.venv-agent-test\Scripts\Activate.ps1
+python -m pip install -r requirements-agent-test.txt
+az login
+$env:KUBE_INVESTIGATOR_MCP_URL = "https://<your-public-mcp-host>/mcp"
+python .\examples\test_foundry_mcp_agent.py
+```
+
+Replace the URL placeholder with the full reachable `/mcp` URL (HTTP or HTTPS). The script stops if local tool discovery fails or `inspect_namespace` is missing. It prints the created agent name/version, verifies that it can retrieve the saved definition from Foundry, prints the answer, and reports whether Foundry executed `inspect_namespace`. The Prompt Agent remains in Foundry after the script exits. Re-running the script creates another version of that agent. It does not change the MCP server, existing portal agent, dashboard, or AKS deployment.

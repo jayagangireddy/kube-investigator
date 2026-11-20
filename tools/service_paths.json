@@ -1,0 +1,8 @@
+{
+  "cartservice": {
+    "namespace": "cartservice",
+    "deployment_paths": [],
+    "helm_values_paths": [],
+    "source_directory": null
+  }
+}

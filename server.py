@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,6 +18,10 @@ from tools.kube_namespace import (
 )
 
 PORT = int(os.getenv("PORT", "8000"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 mcp = FastMCP(
     "Kube Investigator",

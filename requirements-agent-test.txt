@@ -1,0 +1,5 @@
+# Optional local-only dependencies for examples/test_foundry_mcp_agent.py.
+# Keep separate from requirements.txt so the MCP server image remains unchanged.
+azure-ai-projects>=2.3,<3
+azure-identity>=1.17,<2
+mcp>=2.2,<3
