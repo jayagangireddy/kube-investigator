@@ -40,7 +40,7 @@ spec:
             - name: KUBE_INVESTIGATOR_MCP_URL
               value: "http://kube-investigator-mcp.kube-investigator.svc.cluster.local:8000/mcp"
             - name: CHAT_TIMEOUT_SECONDS
-              value: "45"
+              value: "120"
             - name: FOUNDRY_TIMEOUT_SECONDS
               value: "30"
             - name: MCP_TIMEOUT_SECONDS

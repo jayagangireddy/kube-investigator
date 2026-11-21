@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import logging
 import os
 import re
@@ -127,198 +128,178 @@ def _api_list(namespace: str, api_prefix: str, resource: str) -> list[dict[str, 
     return result.get("items", [])
 
 
-def _compact(kind: str, item: dict[str, Any]) -> dict[str, Any]:
-    metadata = item.get("metadata", {})
-    spec = item.get("spec", {})
-    status = item.get("status", {})
-    result: dict[str, Any] = {
-        "kind": kind,
-        "name": metadata.get("name"),
-        "namespace": metadata.get("namespace"),
-        "createdAt": metadata.get("creationTimestamp"),
-        "labels": metadata.get("labels", {}),
-    }
-
-    if kind == "Pod":
-        result.update(
-            phase=status.get("phase"),
-            nodeName=spec.get("nodeName"),
-            podIP=status.get("podIP"),
-            containers=[
-                {
-                    "name": container.get("name"),
-                    "restartCount": container.get("restartCount"),
-                    "state": next(iter(container.get("state", {})), None),
-                    "reason": next(
-                        iter(container.get("state", {}).values()), {}
-                    ).get("reason"),
-                    "lastTermination": {
-                        "reason": (
-                            container.get("lastState", {}).get("terminated", {}).get("reason")
-                        ),
-                        "exitCode": (
-                            container.get("lastState", {}).get("terminated", {}).get("exitCode")
-                        ),
-                        "timestamp": (
-                            container.get("lastState", {}).get("terminated", {}).get("finishedAt")
-                        ),
-                    },
-                }
-                for container in status.get("containerStatuses", [])
-            ],
-        )
-    elif kind in {"Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"}:
-        result.update(
-            desiredReplicas=spec.get("replicas"),
-            readyReplicas=status.get("readyReplicas"),
-            availableReplicas=status.get("availableReplicas"),
-            updatedReplicas=status.get("updatedReplicas"),
-        )
-    elif kind == "Service":
-        result.update(
-            type=spec.get("type"),
-            clusterIP=spec.get("clusterIP"),
-            ports=spec.get("ports", []),
-        )
-    elif kind == "Endpoints":
-        result["subsets"] = [
-            {
-                "addresses": [
-                    address.get("ip") for address in subset.get("addresses", [])
-                ],
-                "notReadyAddresses": [
-                    address.get("ip")
-                    for address in subset.get("notReadyAddresses", [])
-                ],
-                "ports": subset.get("ports", []),
-            }
-            for subset in item.get("subsets", [])
-        ]
-    elif kind == "ConfigMap":
-        data = item.get("data", {})
-        binary_data = item.get("binaryData", {})
-        result.update(
-            dataKeys=sorted(data),
-            binaryDataKeys=sorted(binary_data),
-            immutable=item.get("immutable"),
-        )
-    elif kind == "PersistentVolumeClaim":
-        result.update(
-            phase=status.get("phase"),
-            storageClassName=spec.get("storageClassName"),
-            accessModes=spec.get("accessModes", []),
-            capacity=status.get("capacity"),
-        )
-    elif kind == "Event":
-        result.update(
-            eventType=item.get("type"),
-            reason=item.get("reason"),
-            message=item.get("message"),
-            involvedObject=item.get("involvedObject"),
-            count=item.get("count"),
-            lastTimestamp=item.get("lastTimestamp") or item.get("eventTime"),
-        )
-    elif kind in {"Job", "CronJob"}:
-        result.update(
-            active=status.get("active"),
-            succeeded=status.get("succeeded"),
-            failed=status.get("failed"),
-            lastScheduleTime=status.get("lastScheduleTime"),
-            lastSuccessfulTime=status.get("lastSuccessfulTime"),
-        )
-    elif kind == "Ingress":
-        result.update(
-            ingressClassName=spec.get("ingressClassName"),
-            hosts=[
-                rule.get("host")
-                for rule in spec.get("rules", [])
-                if rule.get("host")
-            ],
-            addresses=status.get("loadBalancer", {}).get("ingress", []),
-        )
-    elif kind == "NetworkPolicy":
-        result.update(
-            podSelector=spec.get("podSelector"),
-            policyTypes=spec.get("policyTypes", []),
-        )
-
-    evidence = []
-    def add(field: str, value: Any) -> None:
-        evidence.append({"tool": "inspect_namespace", "kind": kind,
-                         "namespace": metadata.get("namespace"), "resource": metadata.get("name"),
-                         "field": field, "value": value,
-                         "observedAt": datetime.now(timezone.utc).isoformat()})
-
-    if kind == "Pod":
-        for index, container in enumerate(status.get("containerStatuses", [])):
-            for state in ("waiting", "terminated"):
-                reason = container.get("state", {}).get(state, {}).get("reason")
-                if reason:
-                    add(f"status.containerStatuses[{index}].state.{state}.reason", reason)
-            if container.get("restartCount", 0):
-                add(f"status.containerStatuses[{index}].restartCount", container["restartCount"])
-        if not evidence and status.get("phase") not in (None, "Running", "Succeeded"):
-            add("status.phase", status["phase"])
-    elif kind == "Event" and item.get("type") == "Warning" and item.get("message"):
-        add("message", item["message"])
-    result["evidence"] = evidence
-    return result
-
-
 def _read_resource(
     namespace: str, key: str, api_prefix: str, resource: str, kind: str
 ) -> tuple[str, list[dict[str, Any]], dict[str, str] | None]:
     try:
-        items = _api_list(namespace, api_prefix, resource)
-        return key, [_compact(kind, item) for item in items], None
+        return key, _api_list(namespace, api_prefix, resource), None
     except KubernetesReadError as exc:
         return key, [], {"code": exc.code, "message": exc.message}
 
 
 def _inspect_namespace(namespace: str) -> dict[str, Any]:
-    if (
-        not isinstance(namespace, str)
-        or not NAMESPACE_PATTERN.fullmatch(namespace)
-    ):
-        return {
-            "error": {
-                "code": "invalid_namespace",
-                "message": "namespace must be a valid Kubernetes namespace name.",
-            }
-        }
-
+    if not isinstance(namespace, str) or not NAMESPACE_PATTERN.fullmatch(namespace):
+        return {"error": {"code": "invalid_namespace", "message": "namespace must be a valid Kubernetes namespace name."}}
     allowed = _allowed_namespaces()
     if "*" not in allowed and namespace not in allowed:
-        return {
-            "error": {
-                "code": "namespace_not_allowed",
-                "message": "The requested namespace is not in the server allowlist.",
-                "allowedNamespaces": sorted(allowed),
-            }
-        }
+        return {"error": {"code": "namespace_not_allowed", "message": "The requested namespace is not in the server allowlist.", "allowedNamespaces": sorted(allowed)}}
 
     resources: dict[str, list[dict[str, Any]]] = {}
     errors: dict[str, dict[str, str]] = {}
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [
-            executor.submit(_read_resource, namespace, *resource_spec)
-            for resource_spec in SUPPORTED_RESOURCES
-        ]
+        futures = [executor.submit(_read_resource, namespace, *spec) for spec in SUPPORTED_RESOURCES]
         for future in futures:
             key, items, error = future.result()
             resources[key] = items
             if error:
                 errors[key] = error
 
-    evidence = [entry for items in resources.values() for item in items for entry in item.pop("evidence")]
-    for index, entry in enumerate(evidence, 1):
-        entry["id"] = f"ev-{index:03d}"
-    return {
-        "namespace": namespace,
-        "resources": resources,
-        "errors": errors,
-        "evidence": evidence,
-    }
+    evidence: list[dict[str, Any]] = []
+    evidence_by_resource: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+    findings: list[dict[str, Any]] = []
+    investigation_id = base64.urlsafe_b64encode(uuid.uuid4().bytes).decode("ascii").rstrip("=")
+    collected = datetime.now(timezone.utc).isoformat()
+
+    def finding(kind: str, item: dict[str, Any]) -> dict[str, Any]:
+        return {"kind": kind, "resource": item.get("metadata", {}).get("name"), "evidence": []}
+
+    def add(target: dict[str, Any], item: dict[str, Any], path: str, label: str | None = None) -> None:
+        value: Any = item
+        for part in re.findall(r"[^.\[\]]+|\[\d+\]", path):
+            if part.startswith("["):
+                index = int(part[1:-1])
+                if not isinstance(value, list) or index >= len(value):
+                    return
+                value = value[index]
+            elif isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return
+        resource_name = item.get("metadata", {}).get("name")
+        resource_namespace = item.get("metadata", {}).get("namespace", namespace)
+        key = (target["kind"], resource_namespace, resource_name)
+        entry = evidence_by_resource.get(key)
+        if entry is None:
+            entry = {"id": f"{investigation_id}-{len(evidence) + 1}", "tool": "inspect_namespace",
+                     "kind": target["kind"], "namespace": resource_namespace, "resource": resource_name,
+                     "observedAt": collected, "fields": {}}
+            evidence_by_resource[key] = entry
+            evidence.append(entry)
+        entry["fields"][path] = value
+        if entry["id"] not in target["evidence"]:
+            target["evidence"].append(entry["id"])
+
+    for pod in resources["pods"]:
+        target = finding("Pod", pod)
+        add(target, pod, "status.phase", "phase")
+        statuses = pod.get("status", {}).get("containerStatuses", [])
+        specs = pod.get("spec", {}).get("containers", [])
+        for index, status in enumerate(statuses):
+            prefix = f"status.containerStatuses[{index}]"
+            for field in ("name", "ready", "restartCount", "image"):
+                add(target, pod, f"{prefix}.{field}")
+            for state in ("waiting", "running", "terminated"):
+                if state in status.get("state", {}):
+                    # The state name is a field in the API, not an inferred diagnosis.
+                    if state == "running":
+                        add(target, pod, f"{prefix}.state.running")
+                    else:
+                        for field in ("reason", "message", "exitCode", "signal", "finishedAt"):
+                            add(target, pod, f"{prefix}.state.{state}.{field}")
+            for field in ("reason", "exitCode", "signal", "finishedAt"):
+                add(target, pod, f"{prefix}.lastState.terminated.{field}")
+        for index, container in enumerate(specs):
+            prefix = f"spec.containers[{index}]"
+            # Include spec image and limits even when no status has appeared yet.
+            corresponding = next((status for status in statuses if status.get("name") == container.get("name")), None)
+            if corresponding is None:
+                add(target, pod, f"{prefix}.name")
+            if corresponding is None or "image" not in corresponding:
+                add(target, pod, f"{prefix}.image")
+            for limit in ("cpu", "memory", "ephemeral-storage"):
+                add(target, pod, f"{prefix}.resources.limits.{limit}")
+        for index, condition in enumerate(pod.get("status", {}).get("conditions", [])):
+            if condition.get("status") == "False" and condition.get("reason"):
+                for field in ("type", "status", "reason", "message"):
+                    add(target, pod, f"status.conditions[{index}].{field}")
+        findings.append(target)
+
+    for deployment in resources["deployments"]:
+        target = finding("Deployment", deployment)
+        for path, label in (("spec.replicas", "desiredReplicas"), ("status.readyReplicas", "readyReplicas"),
+                            ("status.availableReplicas", "availableReplicas"), ("status.updatedReplicas", "updatedReplicas")):
+            add(target, deployment, path, label)
+        findings.append(target)
+
+    for key, kind in (("statefulsets", "StatefulSet"), ("daemonsets", "DaemonSet"), ("replicasets", "ReplicaSet")):
+        for workload in resources[key]:
+            status = workload.get("status", {})
+            desired = workload.get("spec", {}).get("replicas")
+            if kind == "DaemonSet":
+                desired = status.get("desiredNumberScheduled")
+                ready = status.get("numberReady")
+            else:
+                ready = status.get("readyReplicas")
+            if desired is None or ready is None or desired != ready:
+                target = finding(kind, workload)
+                for path in ("spec.replicas", "status.readyReplicas", "status.availableReplicas", "status.updatedReplicas",
+                             "status.desiredNumberScheduled", "status.numberReady", "status.numberUnavailable"):
+                    add(target, workload, path)
+                findings.append(target)
+
+    for endpoint in resources["endpoints"]:
+        target = finding("Endpoints", endpoint)
+        for i, subset in enumerate(endpoint.get("subsets", [])):
+            for j, address in enumerate(subset.get("notReadyAddresses", [])):
+                add(target, endpoint, f"subsets[{i}].notReadyAddresses[{j}].ip")
+                add(target, endpoint, f"subsets[{i}].notReadyAddresses[{j}].targetRef.name")
+        if target["evidence"]:
+            findings.append(target)
+
+    # Relevant normal events explain starts, scheduling, image pulls, and back-off.
+    relevant_normal = {"BackOff", "Pulled", "Pulling", "Scheduled", "Started", "Killing", "Created"}
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for event in resources["events"]:
+        if event.get("type") != "Warning" and not (event.get("type") == "Normal" and event.get("reason") in relevant_normal):
+            continue
+        obj = event.get("involvedObject", {})
+        key = (event.get("type"), event.get("reason"), event.get("message"), obj.get("kind"), obj.get("namespace"), obj.get("name"), obj.get("uid"), obj.get("fieldPath"))
+        grouped.setdefault(key, []).append(event)
+    for events in grouped.values():
+        target = finding("Event", events[0])
+        for path in ("type", "reason", "message", "involvedObject.name", "involvedObject.kind", "involvedObject.fieldPath"):
+            add(target, events[0], path)
+        target["sources"] = []
+        for event in events:
+            # Preserve each source's count and timestamp instead of inventing an aggregate.
+            source = {"evidence": []}
+            for path in ("count", "lastTimestamp", "eventTime", "series.count", "series.lastObservedTime"):
+                add(source | {"kind": "Event"}, event, path)
+            target["sources"].append(source)
+        timestamp_candidates = [(event.get(field), source["evidence"][0])
+                                for event, source in zip(events, target["sources"])
+                                for field in ("lastTimestamp", "eventTime") if event.get(field) and source["evidence"]]
+        timestamp_candidates.extend((event.get("series", {}).get("lastObservedTime"), source["evidence"][0])
+                                    for event, source in zip(events, target["sources"])
+                                    if event.get("series", {}).get("lastObservedTime") and source["evidence"])
+        if timestamp_candidates:
+            target["latestOccurrence"] = max(timestamp_candidates, key=lambda pair: pair[0])[1]
+        findings.append(target)
+
+    for pvc in resources["persistentvolumeclaims"]:
+        if pvc.get("status", {}).get("phase") != "Bound":
+            target = finding("PersistentVolumeClaim", pvc)
+            for path in ("status.phase", "spec.storageClassName", "status.capacity.storage"):
+                add(target, pvc, path)
+            findings.append(target)
+    for key, kind in (("jobs", "Job"), ("cronjobs", "CronJob")):
+        for item in resources[key]:
+            if item.get("status", {}).get("failed"):
+                target = finding(kind, item)
+                for path in ("status.active", "status.succeeded", "status.failed", "status.lastScheduleTime", "status.lastSuccessfulTime"):
+                    add(target, item, path)
+                findings.append(target)
+    return {"namespace": namespace, "findings": findings, "evidence": evidence, "errors": errors}
 
 
 

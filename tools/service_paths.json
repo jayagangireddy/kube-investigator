@@ -3,6 +3,6 @@
     "namespace": "cartservice",
     "deployment_paths": [],
     "helm_values_paths": [],
-    "source_directory": null
+    "source_directory": "src/cart"
   }
 }

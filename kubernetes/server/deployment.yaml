@@ -37,7 +37,7 @@ spec:
             - name: GITHUB_REPO_OWNER
               value: "jayagangireddy"
             - name: GITHUB_REPO_NAME
-              value: "kube-investigator"
+              value: "astronamy"
             - name: KUBERNETES_API_TIMEOUT_SECONDS
               value: "4"
             - name: PYTHONDONTWRITEBYTECODE

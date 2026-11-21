@@ -56,15 +56,15 @@ def _github_get(
     params: dict[str, str | int] | None = None,
     *,
     max_response_bytes: int = MAX_GITHUB_RESPONSE_BYTES,
-) -> tuple[dict[str, Any] | list[Any], bool]:
+    raw: bool = False,
+) -> tuple[dict[str, Any] | list[Any] | bytes, bool]:
     owner, name = _github_repository()
-    api_path = (
-        f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/"
-        f"{endpoint.lstrip('/')}"
-    )
+    api_path = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+    if endpoint.lstrip('/'):
+        api_path += f"/{endpoint.lstrip('/')}"
     query = f"?{urlencode(params)}" if params else ""
     headers = {
-        "Accept": "application/vnd.github+json",
+        "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json",
         "User-Agent": "Kube-Investigator-MCP",
         "X-GitHub-Api-Version": GITHUB_API_VERSION,
     }
@@ -81,7 +81,7 @@ def _github_get(
                     "github_response_too_large",
                     "GitHub API response exceeded the configured size limit.",
                 )
-            result = json.loads(raw_body)
+            result = raw_body if raw else json.loads(raw_body)
             link_header = response.headers.get("Link", "")
     except GitHubReadError:
         raise
@@ -135,7 +135,7 @@ def _github_get(
             "GitHub API returned an unreadable response.",
         ) from None
 
-    if not isinstance(result, (dict, list)):
+    if not isinstance(result, (dict, list, bytes)):
         raise GitHubReadError(
             "github_api_error",
             "GitHub API returned an unexpected response format.",
@@ -329,6 +329,15 @@ def find_repo_files(
                       if isinstance(item, dict) and isinstance(item.get("path"), str)}
         mappings = _service_path_mappings()
         mapping = mappings.get(service.casefold())
+        # Infer conventional service directories from the tree, without fetching file contents.
+        service_stem = re.sub(r"service$", "", service.casefold()) or service.casefold()
+        inferred_dir = next((path for path in tree_paths
+                             if tree_types.get(path) == "tree" and
+                             path.casefold() in {f"src/{service.casefold()}", f"src/{service_stem}",
+                                                 f"services/{service.casefold()}", f"services/{service_stem}"}), None)
+        if inferred_dir and not (mapping and mapping.get("source_directory")):
+            mapping = dict(mapping or {})
+            mapping["source_directory"] = inferred_dir
         mapped_results: list[dict[str, str]] = []
         mapping_used = False
         mapping_stale = False
@@ -339,6 +348,31 @@ def find_repo_files(
                 declared_paths = declared_paths + [mapping["source_directory"]]
             mapping_stale = bool(declared_paths) and not mapping_used
 
+        if mapping_used and mapping.get("source_directory"):
+            prefix = mapping["source_directory"] + "/"
+            candidates = []
+            for path in tree_paths:
+                if not path.startswith(prefix) or tree_types.get(path) != "blob":
+                    continue
+                name = path.rsplit("/", 1)[-1].casefold()
+                if name.startswith("dockerfile"):
+                    priority, purpose = 0, "Container build"
+                elif name.endswith((".yaml", ".yml", ".json", ".toml", ".env", ".config")):
+                    priority, purpose = 1, "Configuration or manifest"
+                elif name.endswith((".cs", ".go", ".py", ".js", ".ts", ".java", ".rs")) and "/test" not in path.casefold():
+                    priority, purpose = 2, "Service source"
+                else:
+                    continue
+                candidates.append((priority, path, purpose))
+            mapped_results.extend({"path": path, "purpose": purpose}
+                                  for _, path, purpose in sorted(candidates))
+            existing_paths = {item["path"] for item in mapped_results}
+            for path in tree_paths:
+                lowered = path.casefold()
+                if (tree_types.get(path) == "blob" and path not in existing_paths
+                    and service.casefold() in lowered
+                    and lowered.endswith((".yaml", ".yml", ".json", ".toml"))):
+                    mapped_results.append({"path": path, "purpose": "Service configuration or manifest"})
         if query and mapping_used:
             mapped_results = [
                 item for item in mapped_results
@@ -430,12 +464,33 @@ def read_repo_file(
         declared_size = result.get("size")
         if isinstance(declared_size, int) and declared_size > MAX_REPO_FILE_BYTES:
             raise GitHubReadError("repo_file_too_large", f"File exceeds the {MAX_REPO_FILE_BYTES}-byte download limit.")
-        if result.get("encoding") != "base64" or not isinstance(result.get("content"), str):
-            raise GitHubReadError("unsupported_file_type", "GitHub did not return this path as a supported text file.")
-        try:
-            content_bytes = base64.b64decode(result["content"], validate=True)
-        except (ValueError, base64.binascii.Error):
-            raise GitHubReadError("github_api_error", "GitHub returned invalid base64 file content.") from None
+        encoding = result.get("encoding")
+        inline = result.get("content")
+        if encoding not in (None, "none", "base64"):
+            raise GitHubReadError("unsupported_file_encoding", "GitHub returned an unsupported file encoding.")
+        if encoding == "base64" and isinstance(inline, str) and (inline or declared_size == 0):
+            try:
+                # GitHub wraps Base64 content in lines; preserve strict validation
+                # after removing only the permitted line separators.
+                content_bytes = base64.b64decode(inline.replace("\r", "").replace("\n", ""), validate=True)
+            except (ValueError, base64.binascii.Error):
+                raise GitHubReadError("github_invalid_content", "GitHub returned invalid base64 file content.") from None
+        elif inline not in (None, ""):
+            raise GitHubReadError("github_invalid_content", "GitHub returned unsupported inline file content.")
+        else:
+            # Use the same authenticated Contents API and immutable commit, never
+            # an untrusted download URL from the API response.
+            try:
+                content_bytes, _ = _github_get(
+                    f"contents/{endpoint_path}", {"ref": commit_sha},
+                    max_response_bytes=MAX_REPO_FILE_BYTES, raw=True,
+                )
+            except GitHubReadError as exc:
+                if exc.code == "github_response_too_large":
+                    raise GitHubReadError("repo_file_too_large", f"File exceeds the {MAX_REPO_FILE_BYTES}-byte download limit.") from exc
+                raise
+            if not isinstance(content_bytes, bytes):
+                raise GitHubReadError("github_invalid_content", "GitHub did not return raw file content.")
         if len(content_bytes) > MAX_REPO_FILE_BYTES:
             raise GitHubReadError("repo_file_too_large", f"File exceeds the {MAX_REPO_FILE_BYTES}-byte download limit.")
         try:
