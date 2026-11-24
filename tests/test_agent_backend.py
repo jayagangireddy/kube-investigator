@@ -38,10 +38,16 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('ev-1', result.reply)
         self.assertIn('abc123', result.reply)
         self.assertIn('read_repo_file', call['agent']['instructions'])
-    async def test_namespace_resolution_failure(self):
-        result, call = await self.invoke('Why is unknown failing?', 'I could not verify the namespace; please provide it.')
-        self.assertIn('namespace', result.reply)
-        self.assertIn('Never infer a namespace', call['agent']['instructions'])
+    async def test_service_namespace_instruction(self):
+        _, call = await self.invoke('Why is cartservice failing?', 'Inspecting cartservice')
+        instructions = call['agent']['instructions']
+        self.assertIn('namespace="cartservice"', instructions)
+        self.assertIn('Do not call find_repo_files to discover a namespace', instructions)
+        self.assertIn('If the user explicitly provides a namespace, use it instead', instructions)
+    async def test_failed_namespace_inspection_instruction(self):
+        result, call = await self.invoke('Why is unknown failing?', 'Inspection failed; the service status is unknown.')
+        self.assertIn('Inspection failed', result.reply)
+        self.assertIn('If inspection fails, is denied, or relevant resources cannot be inspected', call['agent']['instructions'])
     async def test_mcp_error(self):
         with self.assertRaises(HTTPException) as caught:
             await self.invoke('Inspect cart', '', failure=RuntimeError('sensitive server detail'))
@@ -55,6 +61,23 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             await middleware.process(ctx, run)
         self.assertIn('status=error', captured.output[-1])
         self.assertNotIn('secret', str(captured.output))
+
+    async def test_tool_error_code_logging_and_redaction(self):
+        middleware = backend.SafeToolLogging()
+        async def run(): pass
+        ctx = SimpleNamespace(function=SimpleNamespace(name='read_repo_file'),
+                              arguments={'path': 'private/secret.txt', 'start_line': 500, 'end_line': 999},
+                              result='{"error":{"code":"invalid_line_range","message":"secret contents"}}')
+        with self.assertLogs(backend.logger, level='WARNING') as captured:
+            await middleware.process(ctx, run)
+        self.assertIn('tool=read_repo_file code=invalid_line_range', captured.output[0])
+        self.assertIn('path=redacted', captured.output[0])
+        self.assertNotIn('secret', str(captured.output))
+        ctx.result = '{"error":{"code":"secret-token!","message":"private"}}'
+        with self.assertLogs(backend.logger, level='WARNING') as captured:
+            await middleware.process(ctx, run)
+        self.assertIn('code=unknown', captured.output[0])
+        self.assertNotIn('secret-token', str(captured.output))
 
     def test_response_instructions_support_concise_and_explicit_detail_requests(self):
         instructions = backend.INSTRUCTIONS

@@ -257,7 +257,12 @@ def _resolve_commit(ref: str | None) -> tuple[str, str, str]:
                 "GitHub did not return the configured repository's default branch.",
             )
         resolved_ref = repository["default_branch"]
-    commit, _ = _github_get(f"commits/{quote(resolved_ref, safe='')}")
+    try:
+        commit, _ = _github_get(f"commits/{quote(resolved_ref, safe='')}")
+    except GitHubReadError as exc:
+        if exc.code == "github_resource_not_found_or_inaccessible":
+            raise GitHubReadError("github_ref_not_found_or_inaccessible", "The requested Git reference or configured repository was not found or is not accessible.") from exc
+        raise
     if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str):
         raise GitHubReadError(
             "github_api_error",
@@ -366,20 +371,40 @@ def find_repo_files(
                 candidates.append((priority, path, purpose))
             mapped_results.extend({"path": path, "purpose": purpose}
                                   for _, path, purpose in sorted(candidates))
-            existing_paths = {item["path"] for item in mapped_results}
-            for path in tree_paths:
-                lowered = path.casefold()
-                if (tree_types.get(path) == "blob" and path not in existing_paths
-                    and service.casefold() in lowered
-                    and lowered.endswith((".yaml", ".yml", ".json", ".toml"))):
-                    mapped_results.append({"path": path, "purpose": "Service configuration or manifest"})
-        if query and mapping_used:
+        # Kubernetes and Helm configuration often lives outside src/, and
+        # shared chart files need not contain the service name in their path.
+        existing_paths = {item["path"] for item in mapped_results}
+        for path in tree_paths:
+            lowered = path.casefold()
+            if tree_types.get(path) != "blob" or path in existing_paths:
+                continue
+            if not lowered.endswith((".yaml", ".yml", ".json", ".toml")):
+                continue
+            parts = lowered.split("/")
+            basename = parts[-1]
+            config_area = any(part in {"kubernetes", "k8s", "helm", "charts", "chart", "templates", "overlays", "base"} for part in parts[:-1])
+            service_specific = service.casefold() in lowered or service_stem in parts[:-1]
+            if config_area and service_specific:
+                purpose = "Service deployment or configuration candidate"
+            elif config_area and (basename in {"values.yaml", "values.yml", "kustomization.yaml", "kustomization.yml", "deployment.yaml", "deployment.yml"} or basename.startswith("values-")):
+                purpose = "Shared deployment or Helm configuration candidate; service relevance unverified"
+            else:
+                continue
+            mapped_results.append({"path": path, "purpose": purpose})
+            existing_paths.add(path)
+        if query:
+            # Treat common deployment-file wording as an intent, not a literal
+            # filename: repositories often name these manifests deploy.yaml.
+            deployment_query = bool(re.search(r"\b(?:deployment|deploy|manifest)\b", query))
+            service_query = query in {service.casefold(), service_stem}
             mapped_results = [
                 item for item in mapped_results
-                if query in item["path"].casefold() or query in item["purpose"].casefold()
+                if service_query or query in item["path"].casefold() or query in item["purpose"].casefold()
+                or (deployment_query and ("deployment" in item["purpose"].casefold()
+                                           or item["path"].casefold().endswith(("/deploy.yaml", "/deploy.yml"))))
             ]
-        fallback_used = not mapped_results
-        if fallback_used:
+        fallback_used = not mapping_used
+        if not mapped_results:
             mapped_prefix = mapping.get("source_directory") if mapping else None
             matches = [
                 {"path": path, "purpose": f"Repository tree path matching service '{service}'."}
@@ -392,9 +417,43 @@ def find_repo_files(
             ]
         else:
             matches = mapped_results
+        # Put service-specific deployment candidates ahead of shared chart files,
+        # source directories, and source files when results are bounded.
+        matches.sort(key=lambda item: (
+            0 if item["purpose"] == "Service deployment or configuration candidate" else
+            1 if item["purpose"].startswith("Shared deployment") else
+            2 if "Deployment" in item["purpose"] or "Helm" in item["purpose"] else
+            3 if "directory" in item["purpose"].lower() else 4,
+            item["path"],
+        ))
         count_truncated = len(matches) > limit
         tree_truncated = bool(tree_response.get("truncated", False))
         incomplete = tree_truncated or fallback_used or count_truncated
+        image_evidence: list[dict[str, Any]] = []
+        image_inspection_incomplete = tree_truncated or count_truncated or any(
+            item["purpose"].startswith("Shared deployment") for item in matches[:limit]
+        )
+        manifest_candidates = [item["path"] for item in matches[:limit]
+                               if item["purpose"] == "Service deployment or configuration candidate"]
+        for manifest_path in manifest_candidates[:2]:
+            file_result = read_repo_file(manifest_path, ref=commit_sha)
+            if file_result.get("error"):
+                image_inspection_incomplete = True
+                continue
+            if file_result.get("truncated"):
+                image_inspection_incomplete = True
+            for line_number, line in enumerate(file_result.get("text", "").splitlines(), 1):
+                if re.match(r"^\s*(?:-\s*)?(?:image|imageName|imageRepository|imageTag)\s*:", line, re.IGNORECASE):
+                    image_evidence.append({"path": manifest_path, "commitSha": commit_sha,
+                                           "line": line_number, "text": line.strip(),
+                                           "url": file_result["permalink"].split("#", 1)[0] + f"#L{line_number}"})
+                    if len(image_evidence) >= 10:
+                        image_inspection_incomplete = True
+                        break
+            if len(image_evidence) >= 10:
+                break
+        if len(manifest_candidates) > 2:
+            image_inspection_incomplete = True
         return {
             "repository": f"{owner}/{repo}",
             "service": service,
@@ -402,6 +461,8 @@ def find_repo_files(
             "ref": ref,
             "commitSha": commit_sha,
             "files": matches[:limit],
+            "imageConfigEvidence": image_evidence,
+            "imageInspectionIncomplete": image_inspection_incomplete,
             "evidence": [{"tool": "find_repo_files", "repository": f"{owner}/{repo}",
                           "path": item["path"], "commitSha": commit_sha, "lines": None,
                           "url": f"https://github.com/{quote(owner, safe='')}/{quote(repo, safe='')}/{'blob' if tree_types.get(item['path']) == 'blob' else 'tree'}/{commit_sha}/" + "/".join(quote(part, safe="") for part in item["path"].split("/"))}
@@ -415,6 +476,7 @@ def find_repo_files(
             ),
             "fallbackUsed": fallback_used,
             "incomplete": incomplete,
+            "searchStatus": "incomplete" if tree_truncated or count_truncated else "matches_found" if matches else "no_path_matches",
             "treeTruncated": tree_truncated,
             "resultsTruncated": count_truncated,
         }
