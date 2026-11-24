@@ -88,4 +88,10 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('For a simple factual question, answer directly', instructions)
         self.assertIn('clearly state when evidence is insufficient', instructions)
 
+    def test_configuration_failure_investigation_instructions(self):
+        instructions = backend.INSTRUCTIONS
+        self.assertIn('including OOMKilled, resource-limit failures and image pull errors', instructions)
+        self.assertIn('Compare the live value with the repository value before recommending a change', instructions)
+        self.assertIn('do not assume another branch, an uncommitted local change', instructions)
+
 if __name__ == '__main__': unittest.main()
