@@ -8,6 +8,7 @@ WORKDIR /app
 COPY agent_backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY agent_backend/app.py .
+COPY agent_backend/observability.py .
 
 USER 10001:10001
 EXPOSE 8080

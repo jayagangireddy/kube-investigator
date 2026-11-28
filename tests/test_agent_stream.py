@@ -6,7 +6,7 @@ from unittest.mock import patch
 from agent_backend import app as backend
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
-    async def collect(self, tool_calls=(), fail_connect=False, timeout=False, empty=False, question='Why is cartservice failing?'):
+    async def collect(self, tool_calls=(), fail_connect=False, timeout=False, empty=False, question='Why is cartservice failing?', history=None, captured=None):
         class MCP:
             def __init__(self, **kwargs): pass
             async def __aenter__(self):
@@ -18,6 +18,8 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, **kwargs): self.middleware = kwargs['middleware'][0]
             def run(self, message, *, stream=False):
                 assert stream
+                if captured is not None:
+                    captured.extend(message)
                 middleware = self.middleware
                 class Stream:
                     async def __aiter__(self):
@@ -38,7 +40,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                 return Stream()
         backend.app.state.foundry_client = object()
         with patch.object(backend, 'MCPStreamableHTTPTool', MCP), patch.object(backend, 'Agent', Agent), patch.object(backend, 'CHAT_TIMEOUT_SECONDS', 0.01 if timeout else 5):
-            response = await backend.chat_stream(backend.ChatRequest(message=question))
+            response = await backend.chat_stream(backend.ChatRequest(message=question, history=history or []))
             self.assertEqual(response.media_type, 'text/event-stream')
             frames = [chunk async for chunk in response.body_iterator]
         events = []
@@ -59,6 +61,14 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         for question in ('hi', 'What can you do?', 'What is Kubernetes?'):
             events = await self.collect(question=question)
             self.assertFalse(any(kind == 'status' for kind, _ in events))
+    async def test_stream_receives_followup_history(self):
+        captured = []
+        events = await self.collect(question='Check the deployment', history=[
+            {'role': 'user', 'content': 'Why is paymentservice failing?'},
+            {'role': 'assistant', 'content': 'ImagePullBackOff.'},
+        ], captured=captured)
+        self.assertEqual([m.text for m in captured], ['Why is paymentservice failing?', 'ImagePullBackOff.', 'Check the deployment'])
+        self.assertEqual(events[-1][0], 'final')
     async def test_other_tools_only_when_invoked(self):
         events = await self.collect([('find_repo_files','{}'),('read_repo_file','{}')])
         self.assertEqual([e[1]['tool'] for e in events if e[0]=='status'], ['find_repo_files','find_repo_files','read_repo_file','read_repo_file'])
