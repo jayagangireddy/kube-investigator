@@ -3,9 +3,62 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from pydantic import BaseModel
 from agent_backend import app as backend
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resource_messages_and_call_ids(self):
+        emitted = []
+        middleware = backend.SafeToolLogging(lambda event, payload: emitted.append(payload))
+        class Arguments(BaseModel):
+            path: str
+        cases = [
+            ('inspect_namespace', {'namespace': 'paymentservice'}, 'Inspecting paymentservice'),
+            ('find_repo_files', {'service': 'cartservice'}, 'Searching repository for cartservice'),
+            ('find_repo_files', {'path': 'src/cart'}, 'Searching repository for src/cart'),
+            ('read_repo_file', Arguments(path='src/cart/src/Dockerfile'), 'Reading src/cart/src/Dockerfile'),
+        ]
+        for index, (name, arguments, expected) in enumerate(cases):
+            context = SimpleNamespace(function=SimpleNamespace(name=name), arguments=arguments,
+                                      metadata={'call_id': f'call_{index}'}, result='{}')
+            async def invoke(): pass
+            await middleware.process(context, invoke)
+            start, end = emitted[-2:]
+            self.assertEqual(start['message'], expected)
+            self.assertEqual(end['message'], expected)
+            self.assertEqual(start['invocation_id'], f'call_{index}')
+            self.assertEqual(end['invocation_id'], start['invocation_id'])
+            self.assertEqual(end['state'], 'completed')
+
+    async def test_missing_or_unsafe_arguments_and_failed_call(self):
+        emitted = []
+        middleware = backend.SafeToolLogging(lambda event, payload: emitted.append(payload))
+        context = SimpleNamespace(function=SimpleNamespace(name='read_repo_file'),
+                                  arguments={'path': '../secret-token', 'token': 'sensitive'},
+                                  metadata={}, result=None)
+        async def fail(): raise RuntimeError('sensitive')
+        with self.assertRaises(RuntimeError):
+            await middleware.process(context, fail)
+        start, end = emitted
+        self.assertEqual(start['message'], 'Reading relevant source file')
+        self.assertEqual(end['message'], 'Tool execution failed')
+        self.assertEqual(start['invocation_id'], end['invocation_id'])
+        self.assertNotIn('sensitive', str(emitted))
+        self.assertNotIn('secret-token', str(emitted))
+
+    async def test_resource_preserved_on_failed_call(self):
+        emitted = []
+        middleware = backend.SafeToolLogging(lambda event, payload: emitted.append(payload))
+        context = SimpleNamespace(function=SimpleNamespace(name='read_repo_file'),
+                                  arguments={'path': 'src/cart/src/Dockerfile'},
+                                  metadata={'call_id': 'call_failed'}, result=None)
+        async def fail(): raise RuntimeError('private detail')
+        with self.assertRaises(RuntimeError):
+            await middleware.process(context, fail)
+        self.assertEqual([item['message'] for item in emitted], ['Reading src/cart/src/Dockerfile'] * 2)
+        self.assertEqual([item['invocation_id'] for item in emitted], ['call_failed'] * 2)
+        self.assertEqual(emitted[-1]['state'], 'failed')
+
     async def collect(self, tool_calls=(), fail_connect=False, timeout=False, empty=False, question='Why is cartservice failing?', history=None, captured=None):
         class MCP:
             def __init__(self, **kwargs): pass

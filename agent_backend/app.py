@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
@@ -60,6 +61,16 @@ Recommended fix: Give the most appropriate evidence-supported corrective action 
 Omit full tool results, evidence lists and IDs, file listings, commit SHAs, commands, generic checklists, repeated explanations, and offers to take additional action. When the user explicitly requests logs, evidence, source code, commands, or detailed analysis, provide the requested details, including source references when applicable, instead of enforcing the short format. For a simple factual question, answer directly without the Issue/Recommended fix format."""
 
 
+def _safe_activity_path(value: object) -> bool:
+    """Permit only bounded repository-relative path metadata in activity events."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_./@-]{1,200}", value):
+        return False
+    parts = value.split("/")
+    if any(not part or part.startswith(".") for part in parts):
+        return False
+    return not any(re.search(r"(?:secret|credential|password|token|private.?key|ghp_|github_pat_)", part, re.IGNORECASE) for part in parts)
+
+
 class SafeToolLogging(FunctionMiddleware):
     """Log tool execution metadata only, never arguments, results or exception text."""
 
@@ -74,20 +85,47 @@ class SafeToolLogging(FunctionMiddleware):
             "find_repo_files": ("Searching relevant GitHub files", "Repository search completed"),
             "read_repo_file": ("Reading relevant source file", "Source file inspection completed"),
         }
+        args = getattr(context, "arguments", {})
+        if isinstance(args, BaseModel):
+            args = args.model_dump(include={"namespace", "service", "path"})
+        if not isinstance(args, Mapping):
+            args = {}
+        resource = None
+        if name == "inspect_namespace":
+            value = args.get("namespace")
+            if isinstance(value, str) and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+                resource = f"Inspecting {value}"
+        elif name == "find_repo_files":
+            value = args.get("service")
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value):
+                resource = f"Searching repository for {value}"
+            else:
+                value = args.get("path")
+                if _safe_activity_path(value):
+                    resource = f"Searching repository for {value}"
+        elif name == "read_repo_file":
+            value = args.get("path")
+            if _safe_activity_path(value):
+                resource = f"Reading {value}"
+        metadata = getattr(context, "metadata", {})
+        call_id = metadata.get("call_id") if isinstance(metadata, Mapping) else None
+        if not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", call_id):
+            call_id = uuid.uuid4().hex
+
+        def status(state, generic):
+            if self.emit and name in messages:
+                self.emit("status", {"tool": name, "state": state,
+                                     "message": resource or generic, "invocation_id": call_id})
+
         if self.emit and name in messages:
-            message = messages[name][0]
-            args = getattr(context, "arguments", {})
-            namespace = args.get("namespace") if isinstance(args, Mapping) else None
-            if name == "inspect_namespace" and isinstance(namespace, str) and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace):
-                message += f" {namespace}"
-            self.emit("status", {"tool": name, "state": "started", "message": message})
+            status("started", messages[name][0])
         logger.info("mcp_tool_started tool=%s", safe_name)
         try:
             await call_next()
         except Exception as exc:
             logger.warning("mcp_tool_failed tool=%s error_type=%s", safe_name, type(exc).__name__)
             if self.emit and name in messages:
-                self.emit("status", {"tool": name, "state": "failed", "message": "Tool execution failed"})
+                status("failed", "Tool execution failed")
             raise
         result = context.result
         parts = result if isinstance(result, list) else [result]
@@ -117,8 +155,7 @@ class SafeToolLogging(FunctionMiddleware):
                                safe_name, code, path, start, end)
         logger.info("mcp_tool_finished tool=%s status=%s", safe_name, "error" if failed else "completed")
         if self.emit and name in messages:
-            self.emit("status", {"tool": name, "state": "failed" if failed else "completed",
-                                 "message": "Tool execution failed" if failed else messages[name][1]})
+            status("failed" if failed else "completed", "Tool execution failed" if failed else messages[name][1])
 
 
 class HistoryMessage(BaseModel):
